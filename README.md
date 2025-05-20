@@ -73,6 +73,8 @@ cd elasticsearch-7.17.9
 nohup bin/elasticsearch &  # run Elasticsearch in background
 cd ../..
 python prep_elastic.py --data_path data/dpr/psgs_w100.tsv --index_name wiki  # build index
+./bin/elasticsearch
+curl http://localhost:9200  # test local index
 ```
 
 ### Download Dataset

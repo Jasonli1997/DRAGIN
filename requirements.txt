@@ -1,9 +1,12 @@
-transformers==4.30.2
+transformers>=4.51.0
 beir==1.0.1
 datasets==2.14.1
 tqdm
 scipy
 evaluate==0.2.2
 spacy==3.7.2
+sentence-transformers==4.1.0
+numpy==1.26.4
+urllib3==1.26.15
 accelerate
-elasticsearch==7.17.9
+elasticsearch
