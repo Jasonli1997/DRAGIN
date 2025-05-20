@@ -4,7 +4,7 @@ import spacy
 import torch
 from math import exp
 from scipy.special import softmax
-from retriever import BM25, SGPT
+from .retriever import BM25, SGPT
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 
 logging.basicConfig(level=logging.INFO) 
@@ -30,15 +30,21 @@ class BasicGenerator:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
     def generate(self, input_text, max_length, return_logprobs=False):
-        input_ids = self.tokenizer.encode(input_text, return_tensors="pt")
-        input_ids = input_ids.to(self.model.device)
-        input_length = input_ids.shape[1]
-        attention_mask = torch.ones_like(input_ids)
+        messages = [
+            {"role": "user", "content": input_text}
+        ]
+        text = self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=False # Switches between thinking and non-thinking modes. Default is True.
+        )
+        model_inputs = self.tokenizer([text], return_tensors="pt").to(self.model.device)
+        input_length = model_inputs['input_ids'].shape[1]
 
         if return_logprobs:
             outputs = self.model.generate(
-                input_ids = input_ids, 
-                attention_mask = attention_mask,
+                **model_inputs,
                 max_new_tokens = max_length, 
                 return_dict_in_generate = True, 
                 output_scores = True,
@@ -47,9 +53,9 @@ class BasicGenerator:
                 outputs.sequences, outputs.scores, normalize_logits=True
             )
 
-            generated_tokens = outputs.sequences[:, input_length:]
-            text = self.tokenizer.decode(generated_tokens[0]) # text = "".join(tokens)
-            tokens = [self.tokenizer.decode(t) for t in generated_tokens[0]]
+            generated_tokens = outputs.sequences[0][input_length:].tolist()
+            text = self.tokenizer.decode(generated_tokens, skip_special_tokens=True).strip("\n")
+            tokens = [self.tokenizer.decode(t) for t in generated_tokens]
             logprobs = transition_scores[0]
             logprobs = [p.cpu().numpy() for p in logprobs]
             assert len(tokens) == len(logprobs)
@@ -57,12 +63,11 @@ class BasicGenerator:
         
         else:
             outputs = self.model.generate(
-                input_ids = input_ids, 
-                max_new_tokens = max_length, 
-                attention_mask = attention_mask,
+                **model_inputs,
+                max_new_tokens = max_length,
             )
-            generated_tokens = outputs[:, input_length:]
-            text = self.tokenizer.decode(generated_tokens[0])
+            generated_tokens = outputs[0][input_length:].tolist()
+            text = self.tokenizer.decode(generated_tokens, skip_special_tokens=True).strip("\n")
             return text, None, None
     
     def generate_attn(self, input_text, max_length, solver="max", use_entropy = False, use_logprob = False):
