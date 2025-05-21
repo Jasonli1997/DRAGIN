@@ -19,12 +19,14 @@ class BasicGenerator:
         self.tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
         self.model_config = AutoConfig.from_pretrained(model_name_or_path,
                     trust_remote_code = "falcon" in model_name_or_path)
-        self.model = AutoModelForCausalLM.from_pretrained(model_name_or_path, device_map="auto", 
+        self.model = AutoModelForCausalLM.from_pretrained(model_name_or_path, device_map="auto", torch_dtype="auto", 
                     trust_remote_code = "falcon" in model_name_or_path)
         if self.model_config.model_type == "llama":
             self.space_token = "▁"
         else:
             self.space_token = self.tokenizer.tokenize(' ')[0]
+        self.eos_token = self.tokenizer.special_tokens_map["eos_token"]
+        self.newline_token = self.tokenizer.encode("\n")[-1]
         
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
@@ -71,26 +73,32 @@ class BasicGenerator:
             return text, None, None
     
     def generate_attn(self, input_text, max_length, solver="max", use_entropy = False, use_logprob = False):
-        input_ids = self.tokenizer.encode(input_text, return_tensors="pt")
-        input_ids = input_ids.to(self.model.device)
-        input_length = input_ids.shape[1]
-        attention_mask = torch.ones_like(input_ids)
+        messages = [
+            {"role": "user", "content": input_text}
+        ]
+        text = self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=False # Switches between thinking and non-thinking modes. Default is True.
+        )
+        model_inputs = self.tokenizer([text], return_tensors="pt").to(self.model.device)
+        input_length = model_inputs['input_ids'].shape[1]
 
         outputs = self.model.generate(
-            input_ids = input_ids, 
-            attention_mask = attention_mask,
+            **model_inputs,
             max_new_tokens = max_length, 
             return_dict_in_generate = True, 
             output_scores = True,
         )
         generated_tokens = outputs.sequences[:, input_length:]
         tokens = self.tokenizer.convert_ids_to_tokens(generated_tokens[0])
-        text = self.tokenizer.decode(generated_tokens[0])
+        text = self.tokenizer.decode(generated_tokens[0], skip_special_tokens=True).strip("\n")
 
         # merge tokens
         range_ = []
         for i, t in enumerate(tokens):
-            if i == 0 or t.startswith(self.space_token) or generated_tokens[0][i] == 13 or tokens[i-1] == '</s>':
+            if i == 0 or t.startswith(self.space_token) or generated_tokens[0][i] == self.newline_token or tokens[i-1] == self.eos_token:
                 range_.append([i, i])
             else:
                 range_[-1][-1] += 1
@@ -99,7 +107,7 @@ class BasicGenerator:
         atten = self.model(generated_tokens, output_attentions=True).attentions[-1][0]
         if solver == "max": 
             mean_atten, _ = torch.max(atten, dim=1)
-            mean_atten = torch.mean(mean_atten, dim=0)
+            mean_atten = torch.mean(mean_atten, dim=0)  # multi-head attn
         elif solver == "avg":
             mean_atten = torch.sum(atten, dim=1)
             mean_atten = torch.mean(mean_atten, dim=0)
@@ -109,7 +117,7 @@ class BasicGenerator:
             mean_atten = torch.mean(atten[:, -1], dim=0)
         else:
             raise NotImplementedError
-        if mean_atten.shape[0] > 1 and tokens[0] == '</s>':
+        if mean_atten.shape[0] > 1 and tokens[0] == self.eos_token:
             mean_atten = mean_atten / sum(mean_atten[1:]).item()
         # mean_atten = mean_atten[tl:tr]
             
