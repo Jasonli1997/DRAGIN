@@ -4,7 +4,7 @@ import spacy
 import torch
 from math import exp
 from scipy.special import softmax
-from .retriever import BM25, SGPT
+from .retriever import BM25, SGPT, DatabricksVectorSearch
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 
 logging.basicConfig(level=logging.INFO) 
@@ -190,25 +190,22 @@ class Counter:
 
 class BasicRAG:
     def __init__(self, args):
-        args = args.__dict__ 
+        if hasattr(args, "__dict__"):
+            args = args.__dict__    
         for k, v in args.items():
             setattr(self, k, v)
         self.generator = BasicGenerator(self.model_name_or_path)
         if "retriever" in self.__dict__:
             self.retriever_type = self.retriever
-            if self.retriever_type == "BM25":
-                # gpt2_tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
-                self.retriever = BM25(
-                    tokenizer = self.generator.tokenizer, 
-                    index_name = "wiki" if "es_index_name" not in args else self.es_index_name, 
-                    engine = "elasticsearch",
-                )
-            elif self.retriever_type == "SGPT":
-                self.retriever = SGPT(
-                    model_name_or_path = self.sgpt_model_name_or_path, 
-                    sgpt_encode_file_path = self.sgpt_encode_file_path,
-                    passage_file = self.passage_file
-                )
+            self.retrievers = []
+
+            if isinstance(self.retriever_type, str):
+                self.retrievers.append(self._retriever_selector(args, self.retriever_type))
+            elif isinstance(self.retriever_type, dict):
+                # multi-vector
+                logger.info("Multi-vector setup initiating...")
+                for k, _ in self.retriever_type.items():
+                    self.retrievers.append(self._retriever_selector(args, k))
             else:
                 raise NotImplementedError
         
@@ -216,22 +213,78 @@ class BasicRAG:
 
     def retrieve(self, query, topk=1, max_query_length=64):
         self.counter.retrieve += 1
-        if self.retriever_type == "BM25":
-            _docs_ids, docs = self.retriever.retrieve(
+        if isinstance(self.retriever_type, str):
+            docs = self._retrieve(query, self.retrievers[0], topk, max_query_length)
+
+        elif isinstance(self.retriever_type, dict):
+            # generator decides which index to choose
+            prompt = "Return which vector index to select based on the query and index descriptions.\n"
+            prompt += f"User query: {query}\n"
+            prompt += "Vector Index Summary:\n"
+            for k, v in self.retriever_type.items():
+                prompt += f"- {k}: {v}\n"
+            
+            prompt += "Output ONLY your index selection:"
+            model_output = self.generator.generate(prompt, max_length=64)[0].strip()
+            logger.debug(f"Index selected: {model_output}")
+            names = [r.__class__.__name__ for r in self.retrievers]
+            idx = names.index(model_output)
+            docs = self._retrieve(query, self.retrievers[idx], topk, max_query_length)
+        
+        return docs
+        
+    def _retrieve(self, query, retriever, topk=1, max_query_length=64):
+        self.counter.retrieve += 1
+        retriever_type = retriever.__class__.__name__
+        if retriever_type == "BM25":
+            _docs_ids, docs = retriever.retrieve(
                 queries = [query], 
                 topk = topk, 
                 max_query_length = max_query_length,
             )
-            return docs[0]
-        elif self.retriever_type == "SGPT":
-            docs = self.retriever.retrieve(
+        elif retriever_type == "SGPT":
+            docs = retriever.retrieve(
                 queries = [query], 
                 topk = topk,
             )
-            return docs[0] 
+        elif retriever_type == "DatabricksVectorSearch":
+            docs = retriever.retrieve(
+                queries = [query],
+                columns = ["text", "filename"],
+                topk = topk,
+            )
         else:
             raise NotImplementedError
+        
+        return docs[0]
     
+    def _retriever_selector(self, args, retriever_type):
+        if retriever_type == "BM25":
+            # gpt2_tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
+            retriever = BM25(
+                tokenizer = self.generator.tokenizer, 
+                index_name = "wiki" if "es_index_name" not in args else self.es_index_name, 
+                engine = "elasticsearch",
+            )
+        elif retriever_type == "SGPT":
+            retriever = SGPT(
+                model_name_or_path = self.sgpt_model_name_or_path, 
+                sgpt_encode_file_path = self.sgpt_encode_file_path,
+                passage_file = self.passage_file
+            )
+        
+        elif retriever_type == "DatabricksVectorSearch":
+            retriever = DatabricksVectorSearch(
+                endpoint_name=self.db_endpoint_name,
+                index_name=self.db_index_name
+            )
+        
+        else:
+            return NotImplementedError("Retriever not supported")
+        
+        return retriever
+
+
     def get_top_sentence(self, text):
         sentences = [sent.text.strip() for sent in nlp(text).sents]
         sentences = [sent for sent in sentences if len(sent) > 0]
