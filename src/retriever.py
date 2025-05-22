@@ -13,9 +13,14 @@ from beir.datasets.data_loader import GenericDataLoader
 from beir.retrieval.evaluation import EvaluateRetrieval
 from beir.retrieval.search.lexical import BM25Search
 from beir.retrieval.search.lexical.elastic_search import ElasticSearch
+from databricks.vector_search.client import VectorSearchClient
 
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 logging.basicConfig(level=logging.INFO) 
 logger = logging.getLogger(__name__)
+
+client = VectorSearchClient()
+
 
 def get_random_doc_id():
     return f'_{uuid.uuid4()}'
@@ -342,4 +347,29 @@ class SGPT:
                 psg = self.docs[topk_indices_list[fid][rk][qid]]
                 ret.append(psg)
             psgs.append(ret)
+        return psgs
+    
+class DatabricksVectorSearch:
+    def __init__(self, endpoint_name, index_name):
+        self.index = client.get_index(endpoint_name=endpoint_name,
+                                      index_name=index_name)
+        
+    def retrieve(
+        self, 
+        queries: List[str],
+        columns: List[str],
+        topk: int = 1,
+        query_type: str = "ANN"
+    ):
+        psgs = []
+        for q in queries:
+            results = self.index.similarity_search(
+                query_text=q,
+                num_results=topk,
+                columns=columns,
+                query_type=query_type
+            )
+            ret = [res_list[0] for res_list in results['result']['data_array']]
+            psgs.append(ret)
+
         return psgs
