@@ -31,7 +31,7 @@ class BasicGenerator:
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
-    def generate(self, input_text, max_length, return_logprobs=False):
+    def generate(self, input_text, max_length, enable_thinking=False, return_logprobs=False):
         messages = [
             {"role": "user", "content": input_text}
         ]
@@ -39,7 +39,7 @@ class BasicGenerator:
             messages,
             tokenize=False,
             add_generation_prompt=True,
-            enable_thinking=False # Switches between thinking and non-thinking modes. Default is True.
+            enable_thinking=enable_thinking  # Switches between thinking and non-thinking modes
         )
         model_inputs = self.tokenizer([text], return_tensors="pt").to(self.model.device)
         input_length = model_inputs['input_ids'].shape[1]
@@ -55,56 +55,48 @@ class BasicGenerator:
                 outputs.sequences, outputs.scores, normalize_logits=True
             )
 
-            generated_tokens = outputs.sequences[0][input_length:].tolist()
-            text = self.tokenizer.decode(generated_tokens, skip_special_tokens=True).strip("\n")
-            tokens = [self.tokenizer.decode(t) for t in generated_tokens]
+            generated_ids = outputs.sequences[0][input_length:].tolist()
+            text = self.tokenizer.decode(generated_ids, skip_special_tokens=True).strip("\n")
+            tokens = [self.tokenizer.decode(t) for t in generated_ids]
             logprobs = transition_scores[0]
             logprobs = [p.cpu().numpy() for p in logprobs]
             assert len(tokens) == len(logprobs)
-            return text, tokens, logprobs
+            return text, generated_ids, tokens, logprobs, outputs.scores
         
         else:
             outputs = self.model.generate(
                 **model_inputs,
                 max_new_tokens = max_length,
             )
-            generated_tokens = outputs[0][input_length:].tolist()
-            text = self.tokenizer.decode(generated_tokens, skip_special_tokens=True).strip("\n")
-            return text, None, None
+            generated_ids = outputs[0][input_length:].tolist()
+            # parsing thinking content
+            try:
+                # rindex finding 151668 (</think>)
+                # TODO: make this non-Qwen centric
+                index = len(generated_ids) - generated_ids[::-1].index(151668)
+            except ValueError:
+                index = 0
+            
+            thinking_content = self.tokenizer.decode(generated_ids[:index], skip_special_tokens=True).strip("\n")
+            logger.info(f"Reasoning: {thinking_content}")
+            text = self.tokenizer.decode(generated_ids[index:], skip_special_tokens=True).strip("\n")
+            return text, None, None, None, None
     
     def generate_attn(self, input_text, max_length, solver="max", use_entropy = False, use_logprob = False):
-        messages = [
-            {"role": "user", "content": input_text}
-        ]
-        text = self.tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-            enable_thinking=False # Switches between thinking and non-thinking modes. Default is True.
-        )
-        model_inputs = self.tokenizer([text], return_tensors="pt").to(self.model.device)
-        input_length = model_inputs['input_ids'].shape[1]
-
-        outputs = self.model.generate(
-            **model_inputs,
-            max_new_tokens = max_length, 
-            return_dict_in_generate = True, 
-            output_scores = True,
-        )
-        generated_tokens = outputs.sequences[:, input_length:]
-        tokens = self.tokenizer.convert_ids_to_tokens(generated_tokens[0])
-        text = self.tokenizer.decode(generated_tokens[0], skip_special_tokens=True).strip("\n")
-
+        # TODO: can enable_thinking be True in this case?
+        text, generated_ids, tokens, logprobs, scores = self.generate(input_text=input_text,
+                                                                      max_length=max_length,
+                                                                      return_logprobs=True)
         # merge tokens
         range_ = []
         for i, t in enumerate(tokens):
-            if i == 0 or t.startswith(self.space_token) or generated_tokens[0][i] == self.newline_token or tokens[i-1] == self.eos_token:
+            if i == 0 or t.startswith(self.space_token) or generated_ids[0][i] == self.newline_token or tokens[i-1] == self.eos_token:
                 range_.append([i, i])
             else:
                 range_[-1][-1] += 1
 
         # attention
-        atten = self.model(generated_tokens, output_attentions=True).attentions[-1][0]
+        atten = self.model(generated_ids, output_attentions=True).attentions[-1][0]
         if solver == "max": 
             mean_atten, _ = torch.max(atten, dim=1)
             mean_atten = torch.mean(mean_atten, dim=0)  # multi-head attn
@@ -132,12 +124,6 @@ class BasicGenerator:
 
         # -log prob
         if use_logprob:
-            transition_scores = self.model.compute_transition_scores(
-                outputs.sequences, outputs.scores, normalize_logits=True
-            )
-            logprobs = transition_scores[0]
-            logprobs = [p.cpu().numpy() for p in logprobs]
-            assert len(tokens) == len(logprobs)
             seqlogprobs = []
             for r in range_:
                 logprobseq = sum(logprobs[r[0]:r[1]+1]) / (r[1] - r[0] + 1)
@@ -148,7 +134,7 @@ class BasicGenerator:
         # entropy
         if use_entropy:
             tmp = []
-            for v in outputs.scores:
+            for v in scores:
                 tmp.append(v.cpu())
             softmax_probs = softmax(tmp, axis=-1)
             entropies = -np.sum(softmax_probs * np.log(softmax_probs + 1e-10), axis=-1)
