@@ -55,13 +55,13 @@ class BasicGenerator:
                 outputs.sequences, outputs.scores, normalize_logits=True
             )
 
-            generated_ids = outputs.sequences[0][input_length:].tolist()
-            text = self.tokenizer.decode(generated_ids, skip_special_tokens=True).strip("\n")
-            tokens = [self.tokenizer.decode(t) for t in generated_ids]
+            generated_ids = outputs.sequences[:, input_length:]
+            text = self.tokenizer.decode(generated_ids[0])
+            tokens = [self.tokenizer.decode(t) for t in generated_ids[0]]
             logprobs = transition_scores[0]
             logprobs = [p.cpu().numpy() for p in logprobs]
             assert len(tokens) == len(logprobs)
-            return text, generated_ids, tokens, logprobs, outputs.scores
+            return text, generated_ids, logprobs, outputs
         
         else:
             outputs = self.model.generate(
@@ -78,17 +78,20 @@ class BasicGenerator:
                 index = 0
             
             thinking_content = self.tokenizer.decode(generated_ids[:index], skip_special_tokens=True).strip("\n")
-            logger.info(f"Reasoning: {thinking_content}")
+            if thinking_content:
+                logger.info(f"Reasoning: {thinking_content}")
             text = self.tokenizer.decode(generated_ids[index:], skip_special_tokens=True).strip("\n")
-            return text, None, None, None, None
+            return text, None, None, None
     
     def generate_attn(self, input_text, max_length, solver="max", use_entropy = False, use_logprob = False):
         # TODO: can enable_thinking be True in this case?
-        text, generated_ids, tokens, logprobs, scores = self.generate(input_text=input_text,
-                                                                      max_length=max_length,
-                                                                      return_logprobs=True)
+        text, generated_ids, logprobs, outputs = self.generate(input_text=input_text,
+                                                               max_length=max_length,
+                                                               return_logprobs=True)
         # merge tokens
         range_ = []
+        tokens = self.tokenizer.convert_ids_to_tokens(generated_ids[0])
+        tokens = [t.replace("Ċ", "\n") for t in tokens]
         for i, t in enumerate(tokens):
             if i == 0 or t.startswith(self.space_token) or generated_ids[0][i] == self.newline_token or tokens[i-1] == self.eos_token:
                 range_.append([i, i])
@@ -304,9 +307,12 @@ class SingleRAG(BasicRAG):
         prompt += "Context:\n"
         for i, doc in enumerate(docs):
             prompt += f"[{i+1}] {doc}\n"
-        prompt += "Answer in the same format as before.\n"
-        prompt += case
-        text, _, _ = self.generator.generate(prompt, self.generate_max_length)
+        prompt += "Answer the user query below ONLY using the context above.\n"
+        prompt += f"User Query: {question}"
+        # print("***", prompt)
+        text, _, _, _ = self.generator.generate(input_text=prompt,
+                                                max_length=self.generate_max_length,
+                                                enable_thinking=enable_thinking)
         if self.use_counter == True:
             self.counter.add_generate(text, self.generator.tokenizer)
         return text
@@ -733,7 +739,7 @@ class AttnWeightRAG(BasicRAG):
                 prompt += " ".join(s for s in tmp_li if len(s) > 0)
                 # print('#####', prompt)
                 # prompt += case + " " + text + " " + ptext.strip()
-                new_text, _, _ = self.generator.generate(prompt, self.generate_max_length)
+                new_text, _, _, _ = self.generator.generate(prompt, self.generate_max_length)
                 if self.use_counter == True:
                     self.counter.add_generate(new_text, self.generator.tokenizer)
                     self.counter.hallucinated += 1
