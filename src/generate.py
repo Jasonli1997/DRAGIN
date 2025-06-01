@@ -17,39 +17,45 @@ class BasicGenerator:
     def __init__(self, model_name_or_path):
         logger.info(f"Loading model from {model_name_or_path}")
         self.tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
-        self.model_config = AutoConfig.from_pretrained(model_name_or_path,
-                    trust_remote_code = "falcon" in model_name_or_path)
-        self.model = AutoModelForCausalLM.from_pretrained(model_name_or_path, device_map="auto", torch_dtype="auto", 
-                    trust_remote_code = "falcon" in model_name_or_path)
+        self.model_config = AutoConfig.from_pretrained(
+            model_name_or_path, trust_remote_code="falcon" in model_name_or_path
+        )
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_name_or_path,
+            device_map="auto",
+            torch_dtype="auto",
+            attn_implementation="eager",
+            trust_remote_code="falcon" in model_name_or_path,
+        )
         if self.model_config.model_type == "llama":
             self.space_token = "▁"
         else:
-            self.space_token = self.tokenizer.tokenize(' ')[0]
+            self.space_token = self.tokenizer.tokenize(" ")[0]
         self.eos_token = self.tokenizer.special_tokens_map["eos_token"]
         self.newline_token = self.tokenizer.encode("\n")[-1]
-        
+
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
-    def generate(self, input_text, max_length, enable_thinking=False, return_logprobs=False):
-        messages = [
-            {"role": "user", "content": input_text}
-        ]
+    def generate(
+        self, input_text, max_length, enable_thinking=False, return_logprobs=False
+    ):
+        messages = [{"role": "user", "content": input_text}]
         text = self.tokenizer.apply_chat_template(
             messages,
             tokenize=False,
             add_generation_prompt=True,
-            enable_thinking=enable_thinking  # Switches between thinking and non-thinking modes
+            enable_thinking=enable_thinking,  # Switches between thinking and non-thinking modes
         )
         model_inputs = self.tokenizer([text], return_tensors="pt").to(self.model.device)
-        input_length = model_inputs['input_ids'].shape[1]
+        input_length = model_inputs["input_ids"].shape[1]
 
         if return_logprobs:
             outputs = self.model.generate(
                 **model_inputs,
-                max_new_tokens = max_length, 
-                return_dict_in_generate = True, 
-                output_scores = True,
+                max_new_tokens=max_length,
+                return_dict_in_generate=True,
+                output_scores=True,
             )
             transition_scores = self.model.compute_transition_scores(
                 outputs.sequences, outputs.scores, normalize_logits=True
@@ -62,11 +68,11 @@ class BasicGenerator:
             logprobs = [p.cpu().numpy() for p in logprobs]
             assert len(tokens) == len(logprobs)
             return text, generated_ids, logprobs, outputs
-        
+
         else:
             outputs = self.model.generate(
                 **model_inputs,
-                max_new_tokens = max_length,
+                max_new_tokens=max_length,
             )
             generated_ids = outputs[0][input_length:].tolist()
             # parsing thinking content
@@ -76,11 +82,15 @@ class BasicGenerator:
                 index = len(generated_ids) - generated_ids[::-1].index(151668)
             except ValueError:
                 index = 0
-            
-            thinking_content = self.tokenizer.decode(generated_ids[:index], skip_special_tokens=True).strip("\n")
+
+            thinking_content = self.tokenizer.decode(
+                generated_ids[:index], skip_special_tokens=True
+            ).strip("\n")
             if thinking_content:
                 logger.info(f"Reasoning: {thinking_content}")
-            text = self.tokenizer.decode(generated_ids[index:], skip_special_tokens=True).strip("\n")
+            text = self.tokenizer.decode(
+                generated_ids[index:], skip_special_tokens=True
+            ).strip("\n")
             return text, None, None, None
     
     def generate_attn(self, input_text, max_length, solver="max", use_entropy = False, use_logprob = False):
