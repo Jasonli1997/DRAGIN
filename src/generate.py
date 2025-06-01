@@ -190,99 +190,97 @@ class Counter:
 class BasicRAG:
     def __init__(self, args):
         if hasattr(args, "__dict__"):
-            args = args.__dict__    
+            args = args.__dict__
         for k, v in args.items():
             setattr(self, k, v)
         self.generator = BasicGenerator(self.model_name_or_path)
-        if "retriever" in self.__dict__:
-            self.retriever_type = self.retriever
-            self.retrievers = []
+        if "retriever_configs" in self.__dict__:
+            self.retrievers = {}
+            self.multi_vector_index = (
+                False if len(self.retriever_configs) == 1 else True
+            )
+            print(f"Enable multi-vector index: {self.multi_vector_index}")
 
-            if isinstance(self.retriever_type, str):
-                self.retrievers.append(self._retriever_selector(args, self.retriever_type))
-            elif isinstance(self.retriever_type, dict):
-                # multi-vector
-                logger.info("Multi-vector setup initiating...")
-                for k, _ in self.retriever_type.items():
-                    self.retrievers.append(self._retriever_selector(args, k))
-            else:
-                raise NotImplementedError
-        
+            for config in self.retriever_configs:
+                retriever_name = list(config.keys())[0]
+                config_dict = config[retriever_name]
+                retriever_type, description = config_dict.pop("retriever_type"), config_dict.pop("description")
+                retriever = self._retriever_selector(retriever_type, **config_dict)
+
+                self.retrievers[retriever_name] = {"description": description,
+                                                   "retriever": retriever}
+
         self.counter = Counter()
 
     def retrieve(self, query, topk=1, max_query_length=64):
         self.counter.retrieve += 1
-        if isinstance(self.retriever_type, str):
-            docs = self._retrieve(query, self.retrievers[0], topk, max_query_length)
+        docs = None
+        if not self.multi_vector_index:
+            retriever_name = list(self.retrievers.keys())[0]
+            docs = self._retrieve(query, self.retrievers[retriever_name]['retriever'], topk, max_query_length)
 
-        elif isinstance(self.retriever_type, dict):
+        else:
             # generator decides which index to choose
-            prompt = "Return which vector index to select based on the query and index descriptions.\n"
+            prompt = "Return which vector indices to select based on the query and index descriptions.\n"
             prompt += f"User query: {query}\n"
             prompt += "Vector Index Summary:\n"
-            for k, v in self.retriever_type.items():
-                prompt += f"- {k}: {v}\n"
-            
-            prompt += "Output ONLY your index selection:"
+            for k, v in self.retrievers.items():
+                prompt += f"- {k}: {v['description']}\n"
+
+            prompt += "Output ONLY your index selection(s) in bullet points ('-'), separated by a '\\n':"
             model_output = self.generator.generate(prompt, max_length=64)[0].strip()
-            logger.debug(f"Index selected: {model_output}")
-            names = [r.__class__.__name__ for r in self.retrievers]
-            idx = names.index(model_output)
-            docs = self._retrieve(query, self.retrievers[idx], topk, max_query_length)
-        
+            print(
+                f"Index selected -> {model_output}"
+            )
+            docs = []
+            for ret in model_output.split("\n"):
+                docs.extend(self._retrieve(query, self.retrievers[ret.split("-")[-1].strip()]['retriever'], topk, max_query_length))
+
         return docs
-        
+
     def _retrieve(self, query, retriever, topk=1, max_query_length=64):
         self.counter.retrieve += 1
         retriever_type = retriever.__class__.__name__
         if retriever_type == "BM25":
             _docs_ids, docs = retriever.retrieve(
-                queries = [query], 
-                topk = topk, 
-                max_query_length = max_query_length,
+                queries=[query],
+                topk=topk,
+                max_query_length=max_query_length,
             )
         elif retriever_type == "SGPT":
             docs = retriever.retrieve(
-                queries = [query], 
-                topk = topk,
+                queries=[query],
+                topk=topk,
             )
         elif retriever_type == "DatabricksVectorSearch":
             docs = retriever.retrieve(
-                queries = [query],
-                columns = ["text", "filename"],
-                topk = topk,
+                queries=[query],
+                columns=["text", "filename"],
+                topk=topk,
             )
         else:
-            raise NotImplementedError
-        
+            raise NotImplementedError(f"{retriever_type} not supported...")
+
         return docs[0]
-    
-    def _retriever_selector(self, args, retriever_type):
+
+    def _retriever_selector(self, retriever_type, **kwargs):
         if retriever_type == "BM25":
             # gpt2_tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
             retriever = BM25(
-                tokenizer = self.generator.tokenizer, 
-                index_name = "wiki" if "es_index_name" not in args else self.es_index_name, 
-                engine = "elasticsearch",
+                tokenizer=self.generator.tokenizer,
+                engine="elasticsearch",
+                **kwargs,
             )
         elif retriever_type == "SGPT":
-            retriever = SGPT(
-                model_name_or_path = self.sgpt_model_name_or_path, 
-                sgpt_encode_file_path = self.sgpt_encode_file_path,
-                passage_file = self.passage_file
-            )
-        
+            retriever = SGPT(**kwargs)
+
         elif retriever_type == "DatabricksVectorSearch":
-            retriever = DatabricksVectorSearch(
-                endpoint_name=self.db_endpoint_name,
-                index_name=self.db_index_name
-            )
-        
+            retriever = DatabricksVectorSearch(**kwargs)
+
         else:
             return NotImplementedError("Retriever not supported")
-        
-        return retriever
 
+        return retriever
 
     def get_top_sentence(self, text):
         sentences = [sent.text.strip() for sent in nlp(text).sents]
@@ -292,37 +290,39 @@ class BasicRAG:
     def get_last_sentence(self, text):
         sentences = [sent.text.strip() for sent in nlp(text).sents]
         sentences = [sent for sent in sentences if len(sent) > 0]
-        return sentences[-1] if len(sentences) > 0 else "" 
-    
+        return sentences[-1] if len(sentences) > 0 else ""
+
     def inference(self, question, demo, case):
         # non-retrieval
         assert self.query_formulation == "direct"
-        prompt = "".join([d["case"]+"\n" for d in demo])
+        prompt = "".join([d["case"] + "\n" for d in demo])
         prompt += case
-        text, _, _ = self.generator.generate(prompt, self.generate_max_length)
+        text, _, _, _ = self.generator.generate(prompt, self.generate_max_length)
         if self.use_counter == True:
             self.counter.add_generate(text, self.generator.tokenizer)
         return text
-    
+
 
 class SingleRAG(BasicRAG):
     def __init__(self, args):
         super().__init__(args)
-    
-    def inference(self, question, demo, case):
+
+    def inference(self, question, demo, case, enable_thinking=False):
         assert self.query_formulation == "direct"
         docs = self.retrieve(question, topk=self.retrieve_topk)
         # 对 topk 个 passage 生成 prompt
-        prompt = "".join([d["case"]+"\n" for d in demo])
+        prompt = "".join([d["case"] + "\n" for d in demo])
         prompt += "Context:\n"
         for i, doc in enumerate(docs):
             prompt += f"[{i+1}] {doc}\n"
-        prompt += "Answer the user query below ONLY using the context above.\n"
-        prompt += f"User Query: {question}"
-        # print("***", prompt)
-        text, _, _, _ = self.generator.generate(input_text=prompt,
-                                                max_length=self.generate_max_length,
-                                                enable_thinking=enable_thinking)
+        prompt += "Answer the user query below ONLY using the context above and admit that you don't know if there is no relevant context.\n"
+        prompt += f"**********\nUser Query: {question}\n**********"
+        print("***Prompt***", prompt)
+        text, _, _, _ = self.generator.generate(
+            input_text=prompt,
+            max_length=self.generate_max_length,
+            enable_thinking=enable_thinking,
+        )
         if self.use_counter == True:
             self.counter.add_generate(text, self.generator.tokenizer)
         return text
