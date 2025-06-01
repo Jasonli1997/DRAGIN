@@ -7,7 +7,7 @@ from scipy.special import softmax
 from .retriever import BM25, SGPT, DatabricksVectorSearch
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 
-logging.basicConfig(level=logging.INFO) 
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 nlp = spacy.load("en_core_web_sm")
@@ -185,7 +185,7 @@ class Counter:
             "token_count": self.token - other_counter.token, 
             "sentence_count": self.sentence - other_counter.sentence 
         }
-         
+
 
 class BasicRAG:
     def __init__(self, args):
@@ -291,6 +291,41 @@ class BasicRAG:
         sentences = [sent.text.strip() for sent in nlp(text).sents]
         sentences = [sent for sent in sentences if len(sent) > 0]
         return sentences[-1] if len(sentences) > 0 else ""
+    
+    def decompose_query(self, question):
+        prompt = "Decompose the user query below into sub-queries if the question contains multiple parts or comparisons. Leave it unchanged otherwsie. Output the subqueries or original question in bullet points ('-') separated by '\\n'.\n"
+        prompt += """### Example 1:
+User Query:
+How does attention work in transformers, and how is it different from RNNs?
+
+Decomposed Output:
+- How does attention work in transformers?
+- How is attention different from RNNs?
+
+### Example 2:
+User Query:
+Compare the effectiveness of FiD, RAG-Token, and DRAGIN for long-context QA.
+
+Decomposed Output:
+- How effective is FiD for long-context QA?
+- How effective is RAG-Token for long-context QA?
+- How effective is DRAGIN for long-context QA?
+
+### Example 3:
+User Query:
+What are the benefits of using vector databases in RAG pipelines?
+
+Decomposed Output:
+- What are the benefits of using vector databases in RAG pipelines?"
+"""
+        prompt += f"\nUser Query: {question}\nDecomposed Output:"
+        print("***Query Decomposition Prompt***\n", prompt)
+        text, _, _, _ = self.generator.generate(
+            input_text=prompt,
+            max_length=self.generate_max_length,
+            enable_thinking=self.enable_thinking,
+        )
+        return text.split("\n")
 
     def inference(self, question, demo, case):
         # non-retrieval
@@ -307,9 +342,17 @@ class SingleRAG(BasicRAG):
     def __init__(self, args):
         super().__init__(args)
 
-    def inference(self, question, demo, case, enable_thinking=False):
+    def inference(self, question, demo, case):
         assert self.query_formulation == "direct"
-        docs = self.retrieve(question, topk=self.retrieve_topk)
+        if self.query_decomposition == True:
+            subqueries = self.decompose_query(question)
+            print(f"Questions list: {subqueries}")
+            docs = []
+            for subquery in subqueries:
+                docs.extend(self.retrieve(subquery.strip(), topk=self.retrieve_topk))
+
+        else:
+            docs = self.retrieve(question, topk=self.retrieve_topk)
         # 对 topk 个 passage 生成 prompt
         prompt = "".join([d["case"] + "\n" for d in demo])
         prompt += "Context:\n"
@@ -317,12 +360,15 @@ class SingleRAG(BasicRAG):
             prompt += f"[{i+1}] {doc}\n"
         prompt += "Answer the user query below ONLY using the context above and admit that you don't know if there is no relevant context.\n"
         prompt += f"**********\nUser Query: {question}\n**********"
-        print("***Prompt***", prompt)
+        # TODO: what is case from example datasets
+        prompt += case
+        print("***Inference Prompt***", prompt)
         text, _, _, _ = self.generator.generate(
             input_text=prompt,
             max_length=self.generate_max_length,
             enable_thinking=enable_thinking,
         )
+        
         if self.use_counter == True:
             self.counter.add_generate(text, self.generator.tokenizer)
         return text
@@ -331,7 +377,7 @@ class SingleRAG(BasicRAG):
 class FixLengthRAG(BasicRAG):
     def __init__(self, args):
         super().__init__(args)
-    
+
     def inference(self, question, demo, case):
         assert self.query_formulation == "direct"
         text = ""
@@ -339,7 +385,7 @@ class FixLengthRAG(BasicRAG):
         while True:
             old_len = len(text)
             docs = self.retrieve(retrieve_question, topk=self.retrieve_topk)
-            prompt = "".join([d["case"]+"\n" for d in demo])
+            prompt = "".join([d["case"] + "\n" for d in demo])
             prompt += "Context:\n"
             for i, doc in enumerate(docs):
                 prompt += f"[{i+1}] {doc}\n"
@@ -353,7 +399,9 @@ class FixLengthRAG(BasicRAG):
                 retrieve_question = new_text.strip()
             else:
                 # fix sentence
-                new_text, _, _ = self.generator.generate(prompt, self.generate_max_length)
+                new_text, _, _ = self.generator.generate(
+                    prompt, self.generate_max_length
+                )
                 if self.use_counter == True:
                     self.counter.add_generate(new_text, self.generator.tokenizer)
                 new_text = new_text.strip()
@@ -363,10 +411,14 @@ class FixLengthRAG(BasicRAG):
                     break
                 text = text.strip() + " " + str(sentences[0])
                 retrieve_question = sentences[0]
-            
-            # 判断 token 的个数要少于 generate_max_length 
+
+            # 判断 token 的个数要少于 generate_max_length
             tokens_count = len(self.generator.tokenizer.encode(text))
-            if tokens_count > self.generate_max_length or len(text) <= old_len or "the answer is" in text:
+            if (
+                tokens_count > self.generate_max_length
+                or len(text) <= old_len
+                or "the answer is" in text
+            ):
                 break
         return text
 
@@ -389,15 +441,17 @@ class TokenRAG(BasicRAG):
                     break
                 pos = apr + len(tokens[tr])
                 tr += 1
-            probs = [1 - exp(v) for v in logprobs[tid:tr+1]]
+            probs = [1 - exp(v) for v in logprobs[tid : tr + 1]]
             probs = np.array(probs)
             p = {
                 "avg": np.mean,
                 "max": np.max,
                 "min": np.min,
-            }.get(self.sentence_solver, lambda x: 0)(probs)
-            if p > self.hallucination_threshold: # hallucination
-                # keep sentences before hallucination 
+            }.get(
+                self.sentence_solver, lambda x: 0
+            )(probs)
+            if p > self.hallucination_threshold:  # hallucination
+                # keep sentences before hallucination
                 prev = "" if sid == 0 else " ".join(sentences[:sid])
                 # replace all hallucinated tokens in current sentence with [xxx]
                 curr = sentences[sid]
@@ -406,31 +460,29 @@ class TokenRAG(BasicRAG):
                 # max_prob = 0
                 # for prob, tok in zip(probs, tokens[tid:tr+1]):
                 #     max_prob = max(prob, max_prob)
-                for prob, tok in zip(probs, tokens[tid:tr+1]):
+                for prob, tok in zip(probs, tokens[tid : tr + 1]):
                     apr = curr[pos:].find(tok) + pos
                     if prob > self.hallucination_threshold:
-                    # if prob == max_prob:
-                        curr = curr[:apr] + "[xxx]" + curr[apr+len(tok):]
+                        # if prob == max_prob:
+                        curr = curr[:apr] + "[xxx]" + curr[apr + len(tok) :]
                         pos = apr + len("[xxx]")
                     else:
                         pos = apr + len(tok)
                 return prev, curr, True
             tid = tr + 1
-        
+
         # No hallucination
         return text, None, False
-    
+
     def inference(self, question, demo, case):
         # assert self.query_formulation == "direct"
         text = ""
         while True:
             old_len = len(text)
-            prompt = "".join([d["case"]+"\n" for d in demo])
+            prompt = "".join([d["case"] + "\n" for d in demo])
             prompt += case + " " + text
             new_text, tokens, logprobs = self.generator.generate(
-                prompt, 
-                self.generate_max_length, 
-                return_logprobs=True
+                prompt, self.generate_max_length, return_logprobs=True
             )
             if self.use_counter == True:
                 self.counter.add_generate(new_text, self.generator.tokenizer)
@@ -447,29 +499,35 @@ class TokenRAG(BasicRAG):
                     raise NotImplemented
 
                 docs = self.retrieve(retrieve_question, topk=self.retrieve_topk)
-                prompt = "".join([d["case"]+"\n" for d in demo])
+                prompt = "".join([d["case"] + "\n" for d in demo])
                 prompt += "Context:\n"
                 for i, doc in enumerate(docs):
                     prompt += f"[{i+1}] {doc}\n"
                 prompt += "Answer in the same format as before.\n"
                 prompt += case + " " + text + " " + ptext.strip()
-                new_text, _, _ = self.generator.generate(prompt, self.generate_max_length)
+                new_text, _, _ = self.generator.generate(
+                    prompt, self.generate_max_length
+                )
                 if self.use_counter == True:
                     self.counter.add_generate(new_text, self.generator.tokenizer)
                     self.counter.hallucinated += 1
                 text = text.strip() + " " + ptext.strip() + " " + new_text.strip()
-            
-            # 判断 token 的个数要少于 generate_max_length 
+
+            # 判断 token 的个数要少于 generate_max_length
             tokens_count = len(self.generator.tokenizer.encode(text))
-            if tokens_count > self.generate_max_length or len(text) <= old_len or "the answer is" in text:
+            if (
+                tokens_count > self.generate_max_length
+                or len(text) <= old_len
+                or "the answer is" in text
+            ):
                 break
         return text
-    
+
 
 class EntityRAG(TokenRAG):
     def __init__(self, args):
         super().__init__(args)
-    
+
     def modifier(self, text, tokens, logprobs):
         sentences = [sent.text.strip() for sent in nlp(text).sents]
         sentences = [sent for sent in sentences if len(sent) > 0]
@@ -479,16 +537,16 @@ class EntityRAG(TokenRAG):
             doc = nlp(sent)
             li = [ent.text for ent in doc.ents]
             entity.append(li)
-        
+
         belonging = [-1] * len(text)
         pos = 0
         for tid, tok in enumerate(tokens):
             apr = text[pos:].find(tok) + pos
             assert apr != -1
-            for j in range(pos, apr+len(tok)):
+            for j in range(pos, apr + len(tok)):
                 belonging[j] = tid
             pos = apr + len(tok)
-        
+
         entity_intv = []
         for sid, sent in enumerate(sentences):
             tmp = []
@@ -524,9 +582,11 @@ class EntityRAG(TokenRAG):
                 "avg": np.mean,
                 "max": np.max,
                 "min": np.min,
-            }.get(self.sentence_solver, lambda x: 0)(probs)
-            if p > self.hallucination_threshold: # hallucination
-                # keep sentences before hallucination 
+            }.get(
+                self.sentence_solver, lambda x: 0
+            )(probs)
+            if p > self.hallucination_threshold:  # hallucination
+                # keep sentences before hallucination
                 prev = "" if sid == 0 else " ".join(sentences[:sid])
                 # replace all hallucinated entities in current sentence with [xxx]
                 curr = sentences[sid]
@@ -534,7 +594,7 @@ class EntityRAG(TokenRAG):
                 for prob, ent in zip(probs, entity[sid]):
                     apr = curr[pos:].find(ent) + pos
                     if prob > self.hallucination_threshold:
-                        curr = curr[:apr] + "[xxx]" + curr[apr+len(ent):]
+                        curr = curr[:apr] + "[xxx]" + curr[apr + len(ent) :]
                         pos = apr + len("[xxx]")
                     else:
                         pos = apr + len(ent)
